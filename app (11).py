@@ -96,143 +96,194 @@ ROLE_EXPLANATIONS = {
 }
 
 def _participant_nodes(verb):
-    """Extract grammatical participants, not yet semantic roles."""
+    """Extract participant spans with spaCy dependencies; retain token indices."""
     participants=[]
     for child in verb.children:
-        d=child.dep_.lower()
-        if d in ('nsubj','nsubjpass','csubj','csubjpass'):
-            participants.append(('SUBJECT',phrase(child),d))
-        elif d in ('dobj','obj','attr','oprd','acomp'):
-            participants.append(('OBJECT',phrase(child),d))
-        elif d in ('dative','iobj'):
-            participants.append(('INDIRECT OBJECT',phrase(child),d))
-        elif d in ('prep','agent'):
+        dep=child.dep_.lower()
+        if dep in ('nsubj','nsubjpass','csubj','csubjpass'):
+            participants.append({'kind':'SUBJECT','text':phrase(child),'dep':dep,'start':min(x.i for x in child.subtree),'end':max(x.i for x in child.subtree)+1})
+        elif dep in ('dobj','obj','attr','oprd','acomp'):
+            participants.append({'kind':'OBJECT','text':phrase(child),'dep':dep,'start':min(x.i for x in child.subtree),'end':max(x.i for x in child.subtree)+1})
+        elif dep in ('dative','iobj'):
+            participants.append({'kind':'INDIRECT OBJECT','text':phrase(child),'dep':dep,'start':min(x.i for x in child.subtree),'end':max(x.i for x in child.subtree)+1})
+        elif dep in ('prep','agent'):
             pobj=next((x for x in child.children if x.dep_ in ('pobj','obj')),None)
             if pobj is not None:
-                participants.append(('PP '+child.text.lower(),child.text+' '+phrase(pobj),d))
-    # spaCy's clausal main predicate may be an ADJ with copula as dependent.
-    return participants
+                participants.append({'kind':'PP','prep':child.text.lower(),'text':phrase(child),'dep':dep,'start':min(x.i for x in child.subtree),'end':max(x.i for x in child.subtree)+1})
+    return sorted(participants,key=lambda x:x['start'])
 
 def _frame_description(frame):
-    try:
-        desc=frame.get('description',{})
-        return str(desc.get('primary','')) if isinstance(desc,dict) else str(desc)
-    except Exception:
-        return ''
+    d=frame.get('description',{})
+    return str(d.get('primary','') if isinstance(d,dict) else d)
 
 def _frame_slots(frame):
     slots=[]
     for node in frame.get('syntax',[]):
-        if isinstance(node,dict):
-            pos=str(node.get('pos_tag','')).upper()
-            role=str(node.get('modifiers',{}).get('value','')) if isinstance(node.get('modifiers'),dict) else ''
-            if pos=='NP':
-                slots.append(('NP',role))
-            elif pos in ('PP','PREP','ADJ','ADV','S','S_INF','VP'):
-                slots.append((pos,role))
+        if not isinstance(node,dict): continue
+        pos=str(node.get('pos_tag','')).upper()
+        mods=node.get('modifiers',{})
+        role=str(mods.get('value','') if isinstance(mods,dict) else '')
+        if pos in ('NP','PP','PREP','ADJ','ADV','S','S_INF','VP','VERB'):
+            slots.append({'pos':pos,'role':role,'value':str(node.get('value',''))})
     return slots
 
-def _match_frame(frame, participants):
-    """Conservative ordering heuristic: never claim exact verified match."""
-    slots=_frame_slots(frame)
-    nps=[role for pos,role in slots if pos=='NP' and role]
-    subj=next((x for x in participants if x[0]=='SUBJECT'),None)
-    obj=next((x for x in participants if x[0]=='OBJECT'),None)
-    indirect=next((x for x in participants if x[0]=='INDIRECT OBJECT'),None)
-    if not subj or not nps:
-        return -1,[]
-    # Standard active subject and object alignment; a passive needs special handling.
-    if 'pass' in subj[2]:
-        return -1,[]
-    bindings=[(subj,nps[0])]
-    if obj and len(nps)>1:
-        bindings.append((obj,nps[1]))
-    if indirect and len(nps)>2:
-        bindings.append((indirect,nps[2]))
-    # Reject transitive frames if object is absent, and vice versa.
-    if obj and len(nps)<2:
-        return -1,[]
-    if len(nps)>1 and not obj and not indirect:
-        return -1,[]
-    score=3*len(bindings)-abs(len(nps)-len(bindings))*2
-    return score,bindings
+def _candidate_match(slots,parts,passive=False):
+    """Rank an alignment, rejecting unsupported roles instead of filling from slot order blindly."""
+    if passive: return -1,[], 'Passive voice: manual review required'
+    np_slots=[s for s in slots if s['pos']=='NP' and s['role']]
+    subj=next((p for p in parts if p['kind']=='SUBJECT'),None)
+    obj=next((p for p in parts if p['kind']=='OBJECT'),None)
+    iobj=next((p for p in parts if p['kind']=='INDIRECT OBJECT'),None)
+    if not subj or not np_slots: return -1,[], 'No subject or NP frame slot'
+    if len(np_slots)>1 and not obj and not iobj: return -1,[], 'Missing object'
+    if len(np_slots)==1 and obj: return -1,[], 'Unexpected object'
+    bindings=[(subj,np_slots[0]['role'],'NP subject')]
+    if iobj and len(np_slots)>=3:
+        bindings.append((iobj,np_slots[1]['role'],'NP indirect object'))
+        if obj: bindings.append((obj,np_slots[2]['role'],'NP direct object'))
+    elif obj and len(np_slots)>=2:
+        bindings.append((obj,np_slots[1]['role'],'NP direct object'))
+    # Match a PP role only when a frame explicitly supplies it and its preposition is compatible.
+    pps=[p for p in parts if p['kind']=='PP']
+    prep_slots=[s for s in slots if s['pos'] in ('PREP','PP')]
+    for pp in pps:
+        for j,sl in enumerate(prep_slots):
+            if sl['pos']=='PREP' and sl['value'] and pp.get('prep','') not in sl['value'].lower().split(): continue
+            next_role=next((s['role'] for s in slots[slots.index(sl)+1:] if s['pos']=='NP' and s['role']),None)
+            if next_role and next_role not in [role for _,role,_ in bindings]:
+                bindings.append((pp,next_role,'Preposition and PP frame slot'))
+                break
+    score=4*len(bindings)-abs(len(np_slots)-len([p for p,_,_ in bindings if p['kind']!='PP']))*3
+    return score,bindings,'Syntactic compatibility only; meaning must be reviewed'
 
-def roles(doc):
-    vn,error=get_verbnet()
-    rows=[]; summaries=[]
-    predicates=[t for t in doc if t.pos_=='VERB']
-    # Also display copular predicates separately; they may not have a VerbNet class.
+def _xml_node_frame(frame):
+    synt=[]
+    syn=frame.find('SYNTAX')
+    if syn is not None:
+        for e in syn:
+            value=e.get('value','')
+            if e.tag=='NP':
+                synt.append({'pos_tag':'NP','modifiers':{'value':value}})
+            elif e.tag in ('PREP','PP','VERB','ADV','ADJ','S'):
+                synt.append({'pos_tag':e.tag,'value':value})
+    desc=frame.find('DESCRIPTION')
+    return {'description':{'primary':desc.get('primary','') if desc is not None else ''},'syntax':synt}
+
+@st.cache_resource(show_spinner='Reading VerbNet 3.3 XML files…')
+def _parse_verbnet_zip(raw):
+    import io, zipfile, xml.etree.ElementTree as ET
+    bylemma={}
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        names=[n for n in z.namelist() if n.lower().endswith('.xml') and not n.startswith('__MACOSX')]
+        if not names: raise ValueError('No VerbNet XML files found in this ZIP.')
+        for name in names:
+            try: root=ET.fromstring(z.read(name))
+            except ET.ParseError: continue
+            if root.tag not in ('VNCLASS','VNSUBCLASS'): continue
+            def visit(node,inherited_roles=None,inherited_frames=None):
+                cid=node.get('ID',name.rsplit('/',1)[-1][:-4]); inherited_roles=inherited_roles or []
+                inherited_frames=inherited_frames or []
+                rs=node.find('THEMROLES')
+                local_roles=[x.get('type','') for x in rs] if rs is not None else []
+                fr=node.find('FRAMES')
+                local_frames=[_xml_node_frame(x) for x in fr if x.tag=='FRAME'] if fr is not None else []
+                all_roles=list(dict.fromkeys(inherited_roles+local_roles))
+                all_frames=inherited_frames+local_frames
+                members=node.find('MEMBERS')
+                if members is not None:
+                    for member in members:
+                        lemma=member.get('name','').lower()
+                        if lemma: bylemma.setdefault(lemma,[]).append({'classid':cid,'roles':all_roles,'frames':all_frames})
+                subclasses=node.find('SUBCLASSES')
+                if subclasses is not None:
+                    for sub in subclasses:
+                        if sub.tag=='VNSUBCLASS':visit(sub,all_roles,all_frames)
+            visit(root)
+    return bylemma
+
+def _lexicon_classes(lemma, uploaded):
+    if uploaded:
+        return uploaded.get(lemma,[]), 'Uploaded XML (check that archive is official VerbNet 3.3)'
+    vn,err=get_verbnet()
+    if vn is None:return [],'NLTK VerbNet unavailable: '+str(err)
+    try: ids=vn.classids(lemma)
+    except Exception: ids=[]
+    out=[]
+    for cid in ids[:45]:
+        try:out.append({'classid':cid,'roles':[],'frames':vn.frames(cid)})
+        except Exception:pass
+    return out,'NLTK VerbNet (version NOT guaranteed to be 3.3)'
+
+def _model_predictions(text):
+    """Optional compatible SRL service. No pretrained VerbNet model is silently assumed."""
+    try:
+        config=st.secrets.get('verbnet_srl',{})
+        url=config.get('url','');token=config.get('token','')
+    except Exception:return [],'No compatible trained VerbNet SRL service configured'
+    if not url:return [],'No compatible trained VerbNet SRL service configured'
+    try:
+        import requests
+        headers={'Authorization':'Bearer '+token} if token else {}
+        result=requests.post(url,json={'text':text},headers=headers,timeout=15)
+        result.raise_for_status();data=result.json()
+        if not isinstance(data,dict) or not isinstance(data.get('predictions'),list):raise ValueError('Expected JSON predictions array')
+        allowed=set(ROLE_EXPLANATIONS)|set(ROLE_GLOSS)
+        preds=[p for p in data['predictions'] if isinstance(p,dict) and p.get('role') in allowed and all(k in p for k in ('predicate','expression','role'))]
+        return preds,'External trained SRL service (model and label compatibility must be validated)'
+    except Exception as exc:return [],'Trained SRL service failed: '+str(exc)
+
+def roles(doc, uploaded=None, use_model=False):
+    rows=[];summaries=[]
+    model_preds,model_status=_model_predictions(doc.text) if use_model else ([],'Not enabled')
+    predicates=[t for t in doc if t.pos_=='VERB' and t.dep_ not in ('aux','auxpass')]
     for t in doc:
-        if t.pos_=='ADJ' and any(c.dep_=='acomp' or c.lemma_.lower()=='be' for c in t.children):
-            if t not in predicates: predicates.append(t)
+        if t.pos_=='ADJ' and any(c.lemma_.lower()=='be' for c in t.children) and t not in predicates:predicates.append(t)
     predicates.sort(key=lambda t:t.i)
     for v in predicates:
-        lemma=v.lemma_.lower()
-        parts=_participant_nodes(v)
-        classids=[]
-        if vn:
-            try: classids=vn.classids(lemma)
-            except Exception: classids=[]
-        summary={'Predicate':v.text,'Lemma':lemma,'VerbNet classes':', '.join(classids[:12]) if classids else 'Not found',
-                 'Selected candidate':'None','Candidate frame':'None','Match status':'No verified frame',
-                 'Interpretation':'A candidate class is not a confirmed sense.'}
+        lemma=v.lemma_.lower();parts=_participant_nodes(v)
+        candidates,source=_lexicon_classes(lemma,uploaded)
+        passive=any(p['dep'] in ('nsubjpass','csubjpass') for p in parts)
         best=None
-        for cid in classids[:35]:
-            try: frames=vn.frames(cid)
-            except Exception: continue
-            for f in frames:
-                score,bindings=_match_frame(f,parts)
-                if score>=3 and (best is None or score>best[0]):
-                    best=(score,cid,_frame_description(f),bindings)
-        if best:
-            _,cid,desc,bindings=best
-            summary.update({'Selected candidate':cid,'Candidate frame':desc or 'Unlabelled frame',
-                            'Match status':'Tentative syntactic alignment; review required',
-                            'Interpretation':'NP slots aligned by surface order; polysemy and semantic restrictions are not resolved.'})
-            for part,role in bindings:
-                rows.append({'Predicate':v.text,'Lemma':lemma,'VerbNet class (candidate)':cid,
-                             'Expression':part[1],'Grammatical evidence':part[0]+' / '+part[2],
-                             'Thematic role (suggested)':role,
-                             'Explanation':ROLE_EXPLANATIONS.get(role,'Role name from the candidate VerbNet frame; consult the class definition.'),
-                             'Reliability':'Tentative; manually verify frame and role'})
-            bound={(p[0],p[1]) for p,_ in bindings}
-            for part in parts:
-                if (part[0],part[1]) not in bound:
-                    rows.append({'Predicate':v.text,'Lemma':lemma,'VerbNet class (candidate)':cid,
-                                 'Expression':part[1],'Grammatical evidence':part[0]+' / '+part[2],
-                                 'Thematic role (suggested)':'Unresolved',
-                                 'Explanation':'No reliable role alignment for this participant.',
-                                 'Reliability':'Manual annotation needed'})
-        else:
-            # Pedagogical fallback for a common completion predicate. These are
-            # semantic hypotheses, NOT roles verified against a VerbNet frame.
-            if lemma == 'complete':
-                for part in parts:
-                    suggested = 'Agent' if part[0] == 'SUBJECT' else ('Patient' if part[0] == 'OBJECT' else 'Unresolved')
-                    rows.append({'Predicate':v.text,'Lemma':lemma,
-                                 'VerbNet class (candidate)':', '.join(classids[:3]) or 'Not verified',
-                                 'Expression':part[1], 'Grammatical evidence':part[0]+' / '+part[2],
-                                 'Thematic role (suggested)':suggested,
-                                 'Explanation':('Teaching suggestion based on grammatical structure; not a verified VerbNet frame. '+ROLE_EXPLANATIONS.get(suggested,'')),
-                                 'Reliability':'Teaching heuristic only — verify with VerbNet 3.3'})
-                summary['Interpretation']='The displayed Agent/Patient roles are teaching suggestions, not a confirmed VerbNet frame.'
-                summary['Match status']='Heuristic fallback — not verified'
-                summaries.append(summary)
-                continue
-            if not classids and lemma=='be':
-                summary['Interpretation']='Copular be expresses a state here; no VerbNet event frame assigned.'
-            elif not classids:
-                summary['Interpretation']='No class returned for this lemma in the available VerbNet resource.'
-            else:
-                summary['Interpretation']='VerbNet classes exist, but no compatible basic active frame was found.'
-            for part in parts:
-                rows.append({'Predicate':v.text,'Lemma':lemma,'VerbNet class (candidate)':', '.join(classids[:3]) or 'None',
-                             'Expression':part[1],'Grammatical evidence':part[0]+' / '+part[2],
-                             'Thematic role (suggested)':'Unresolved',
-                             'Explanation':'Do not infer a VerbNet role without a suitable frame.',
-                             'Reliability':'Manual annotation needed'})
+        for c in candidates:
+            for frame in c['frames']:
+                slots=_frame_slots(frame)
+                score,bindings,reason=_candidate_match(slots,parts,passive)
+                if score>=4 and (best is None or score>best[0]):best=(score,c,frame,bindings,reason)
+        summary={'Predicate':v.text,'Lemma':lemma,'Candidate classes':', '.join(x['classid'] for x in candidates[:10]) or 'None',
+                 'Selected candidate':best[1]['classid'] if best else 'None',
+                 'Candidate frame':_frame_description(best[2]) if best else 'No compatible frame',
+                 'Lexicon source':source,
+                 'Status':'Tentative frame alignment' if best else 'No compatible frame / manual review',
+                 'Explanation':'VerbNet classes may contain multiple senses; grammatical matching does not prove semantic correctness.'}
         summaries.append(summary)
-    return rows,summaries,error
+        bound={}
+        if best:
+            for p,role,evidence in best[3]:bound[(p['start'],p['end'])]=(role,evidence)
+        for part in parts:
+            role,evidence=bound.get((part['start'],part['end']),('Unresolved','No matching frame slot'))
+            # Semantic sanity checks: an object cannot be automatically assigned Experiencer
+            # solely because the lexicon lists it in the NP position.
+            if role=='Experiencer' and part['kind']=='OBJECT' and part['text'].lower().startswith(('the paper','a paper','the window')):
+                role,evidence='Unresolved','Experiencer is semantically implausible for this object; review class/frame'
+            # Instrument is a *tentative* adjunct inference, not a verified VerbNet frame role.
+            if role=='Unresolved' and part['kind']=='PP' and part.get('prep')=='with' and lemma in ('cut','slice','chop','write','paint','open','stir'):
+                role,evidence='Instrument','Teaching heuristic: with + tool for an instrumental action (not a verified VerbNet frame role)'
+            if role=='Unresolved' and lemma=='complete':
+                if part['kind']=='SUBJECT':role,evidence='Agent','Teaching heuristic: active subject of complete'
+                elif part['kind']=='OBJECT':role,evidence='Patient','Teaching heuristic: affected object of complete; verify role in actual VerbNet frame'
+            for pred in model_preds:
+                if pred['predicate'].lower()==v.text.lower() and pred['expression'].strip().lower()==part['text'].strip().lower():
+                    role,evidence=pred['role'],'Trained-model suggestion (verify model and VerbNet role inventory)'
+                    break
+            reliability=('Trained model suggestion — verify' if evidence.startswith('Trained-model') else
+                         'Tentative heuristic — verify' if 'heuristic' in evidence.lower() else
+                         'Tentative frame match — verify' if role!='Unresolved' else 'Unresolved — manual review')
+            rows.append({'Predicate':v.text,'Lemma':lemma,'VerbNet class (candidate)':summary['Selected candidate'],
+                         'Expression':part['text'],'Grammatical evidence':part['kind']+' / '+part['dep'],
+                         'Thematic role (suggested)':role,'Corrected role':role,
+                         'Explanation':evidence+'. '+ROLE_EXPLANATIONS.get(role,''),
+                         'Reliability':reliability,'Reviewer notes':''})
+    return rows,summaries,model_status
 
 def trim(s): return s.strip(' \n\t,;:.!?')
 
@@ -292,7 +343,7 @@ def dot_disc(row):
 
 st.title('📚 LinguAnnotate 4D — Four-Layer Annotation Studio')
 st.caption('Penn Treebank POS • Universal Dependencies syntax • VerbNet candidate frames • PDTB 3.0-inspired discourse relations')
-st.warning('Accuracy note: Penn POS and UD dependencies are model predictions. VerbNet provides candidate classes and tentative frame-based roles (not a validated semantic-role parser). PDTB is connective-rule-based (not a trained PDTB parser). Check against your uploaded cheat sheets and official manuals.')
+st.warning('Accuracy note: Penn POS and UD-style dependencies are spaCy predictions; UD labels are approximate mappings. VerbNet classes/frames and roles are candidate analyses, not verified semantic-role parses. Trained SRL is optional and requires a separately configured compatible model. PDTB uses connective rules. Always verify research annotations.')
 nlp=get_nlp()
 if nlp is None:
     st.error('The English spaCy model is missing. Run: python -m spacy download en_core_web_sm  (then restart Streamlit).')
@@ -301,14 +352,25 @@ if nlp is None:
 samples=['Sara gave Ali a book because he needed it.','Although Sara was tired, she completed her assignment.','Ali cut the paper with scissors.','Sara stayed home because she was ill.','The storm broke the window.','Sara sent a parcel to Lahore.']
 example=st.selectbox('Sample sentences', ['Write my own']+samples)
 text=st.text_area('Paste an English sentence or short paragraph',value='' if example=='Write my own' else example,height=115,placeholder='Sara gave Ali a book because he needed it.')
+with st.expander('VerbNet 3.3 source and optional trained SRL (advanced)',expanded=False):
+    st.markdown('Upload a ZIP containing the **official VerbNet 3.3 XML class files**. The PDF guidelines alone are not a machine-readable lexicon. Without a ZIP, the app uses NLTK VerbNet (version not guaranteed).')
+    archive=st.file_uploader('VerbNet 3.3 XML archive (.zip)',type=['zip'])
+    if archive is not None:
+        try:
+            st.session_state['vn33_xml']=_parse_verbnet_zip(archive.getvalue())
+            st.success(f"Loaded {len(st.session_state['vn33_xml'])} verb lemmas from uploaded XML archive. Confirm the ZIP release is VerbNet 3.3.")
+        except Exception as exc:st.error('Could not read VerbNet archive: '+str(exc))
+    st.checkbox('Use a compatible trained VerbNet semantic-role service if configured',key='enable_trained_srl',help='Requires a separately deployed, validated service in Streamlit secrets [verbnet_srl], with url and optional token. No pretrained model is bundled.')
+    st.caption('Optional service contract: POST {"text":"..."} → {"predictions":[{"predicate":"cut","expression":"the paper","role":"Patient"}]}. Check the service model was trained for compatible VerbNet labels.')
 if st.button('Analyse all four layers',type='primary'):
     if not text.strip(): st.info('Please enter some text.');st.stop()
     if len(text)>5000: st.error('Please limit input to 5,000 characters.');st.stop()
     doc=nlp(text)
     posrows=[{'Token':t.text,'Lemma':t.lemma_,'Penn tag':t.tag_,'Full name':PENN.get(t.tag_,'Model-specific tag'),'Universal POS':t.pos_} for t in doc]
     synrows=[{'Token':t.text,'Head':t.head.text if t.head!=t else 'ROOT','spaCy dependency':t.dep_,'Approx. UD equivalent':ud_equivalent(t.dep_),'Meaning':UD.get(ud_equivalent(t.dep_).split(':')[0], 'Review with UD guidelines'),'Head index':t.head.i} for t in doc]
-    semrows,sem_summary,vn_error=roles(doc);discrows=discourse(text)
-    st.session_state['results']={'pos':posrows,'syntax':synrows,'semantic':semrows,'semantic_summary':sem_summary,'verbnet_error':vn_error,'discourse':discrows,'syntax_dot':dot_syntax(doc),'text':text}
+    st.session_state.pop('corrected_semantic',None)
+    semrows,sem_summary,model_status=roles(doc,st.session_state.get('vn33_xml'),st.session_state.get('enable_trained_srl',False));discrows=discourse(text)
+    st.session_state['results']={'pos':posrows,'syntax':synrows,'semantic':semrows,'semantic_summary':sem_summary,'model_status':model_status,'discourse':discrows,'syntax_dot':dot_syntax(doc),'text':text}
 
 if 'results' in st.session_state:
     r=st.session_state['results']
@@ -329,10 +391,8 @@ if 'results' in st.session_state:
         st.caption('spaCy dependency labels can differ from the canonical UD inventory (e.g., dobj versus obj). This view does not claim a fully UD-conformant parse.')
     with tabs[2]:
         st.subheader('VerbNet — candidate classes, frames and thematic roles')
-        st.caption('The application consults the NLTK VerbNet corpus (version may differ from 3.3). Class selection and participant alignment are tentative, not gold-standard VerbNet 3.3 annotation.')
-        if r.get('verbnet_error'):
-            st.error('VerbNet corpus could not be loaded: '+r['verbnet_error'])
-            st.info('Ensure your Streamlit deployment can download the NLTK VerbNet corpus (version may differ from 3.3) during its first run.')
+        st.caption('Upload official VerbNet 3.3 XML archive for version-specific lookup. Without it, NLTK VerbNet is used and its version may differ. Frame alignment remains tentative.')
+        st.info('Trained role prediction: '+r.get('model_status','Not configured'))
         if r.get('semantic_summary'):
             st.markdown('**Predicate and class lookup**')
             st.dataframe(pd.DataFrame(r['semantic_summary']),use_container_width=True,hide_index=True)
@@ -345,9 +405,20 @@ if 'results' in st.session_state:
                     st.write(entry['Interpretation'])
         if r['semantic']:
             st.markdown('**Visual thematic-role map**')
-            st.graphviz_chart(dot_roles(r['semantic']),use_container_width=True)
+            st.markdown('**Editable annotations** — correct any suggested role and add a justification. Changes are retained for export.')
+            edit_df=pd.DataFrame(st.session_state.get('corrected_semantic',r['semantic']))
+            role_choices=sorted(set(ROLE_EXPLANATIONS)|set(ROLE_GLOSS)|{'Unresolved','Other'})
+            edited=st.data_editor(edit_df,use_container_width=True,hide_index=True,num_rows='fixed',key='role_editor',
+                disabled=[c for c in edit_df.columns if c not in ('Corrected role','Reviewer notes')],
+                column_config={'Corrected role':st.column_config.SelectboxColumn('Corrected role',options=role_choices,required=True),
+                               'Reviewer notes':st.column_config.TextColumn('Reviewer notes')})
+            st.session_state['corrected_semantic']=edited.to_dict('records')
+            st.markdown('**Visual thematic-role map (corrected roles)**')
+            vis=edited.to_dict('records')
+            for x in vis:x['Thematic role (suggested)']=x['Corrected role']
+            st.graphviz_chart(dot_roles(vis),use_container_width=True)
             st.markdown('**Participant-by-participant explanation**')
-            st.dataframe(pd.DataFrame(r['semantic']),use_container_width=True,hide_index=True)
+            st.dataframe(edited,use_container_width=True,hide_index=True)
         else:
             st.info('No grammatical participants could be assigned. Inspect the class inventory and annotate manually.')
         st.warning('A matching class and NP order do not establish the correct semantic sense. Passive clauses, complex complements, prepositional roles, and coreference require manual review. Do not use these suggestions as validated research annotations.')
@@ -370,10 +441,10 @@ if 'results' in st.session_state:
         st.caption('Some connectives are ambiguous (e.g. since, while, but). Arg1/Arg2 boundaries and directional labels are approximations.')
     with tabs[4]:
         st.subheader('Download the annotations')
-        combined={'input':r['text'],'penn_pos':r['pos'],'ud_style_syntax':r['syntax'],'verbnet_candidate_frames':r.get('semantic_summary',[]),'verbnet_suggested_roles':r['semantic'],'pdtb_rule_suggestions':r['discourse'],'method_warning':'VerbNet frame matching is tentative and PDTB is rule-based; neither is a validated full parser.'}
+        combined={'input':r['text'],'penn_pos':r['pos'],'ud_style_syntax':r['syntax'],'verbnet_candidate_frames':r.get('semantic_summary',[]),'verbnet_suggested_roles':r['semantic'],'verbnet_corrected_roles':st.session_state.get('corrected_semantic',r['semantic']),'pdtb_rule_suggestions':r['discourse'],'method_warning':'VerbNet frame matching is tentative and PDTB is rule-based; neither is a validated full parser.'}
         st.download_button('Download all results (JSON)',json.dumps(combined,indent=2,ensure_ascii=False),file_name='corpus_annotation.json',mime='application/json')
         for key,name in [('pos','penn_pos'),('syntax','ud_syntax'),('semantic','thematic_roles'),('discourse','pdtb_discourse')]:
-            st.download_button(f'Download {name}.csv',pd.DataFrame(r[key]).to_csv(index=False),file_name=f'{name}.csv',mime='text/csv',key='dl_'+key)
+            st.download_button(f'Download {name}.csv',pd.DataFrame(st.session_state.get('corrected_semantic',r[key]) if key=='semantic' else r[key]).to_csv(index=False),file_name=f'{name}.csv',mime='text/csv',key='dl_'+key)
         st.download_button('Download dependency tree (.dot)',r['syntax_dot'],file_name='dependency_tree.dot')
         st.markdown('**Official references:** [Penn Treebank](https://www.cis.upenn.edu/~treebank/) · [UD](https://universaldependencies.org/u/dep/) · [VerbNet](https://verbs.colorado.edu/verb-index/) · [PDTB 3.0](https://catalog.ldc.upenn.edu/LDC2019T05)')
 else:
