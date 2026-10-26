@@ -1,0 +1,5 @@
+streamlit>=1.35,<2
+spacy>=3.7,<4
+pandas>=2.0,<3
+# Install English model separately with:
+# python -m spacy download en_core_web_sm
