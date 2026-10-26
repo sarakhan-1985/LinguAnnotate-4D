@@ -4,6 +4,7 @@ import json
 import pandas as pd
 import streamlit as st
 import spacy
+import nltk
 from spacy.util import is_package
 
 st.set_page_config(page_title='LinguAnnotate 4D', page_icon='📚', layout='wide')
@@ -61,41 +62,177 @@ def phrase(token):
     if not words: return token.text
     return token.doc[min(t.i for t in words):max(t.i for t in words)+1].text
 
+@st.cache_resource(show_spinner="Loading VerbNet 3 data (first run may download corpus files)…")
+def get_verbnet():
+    """NLTK's verbnet3 reader; gracefully report missing network/corpus."""
+    try:
+        from nltk.corpus import verbnet as vn
+        try:
+            vn.classids('give')
+        except LookupError:
+            nltk.download('verbnet', quiet=True, raise_on_error=True)
+            vn.classids('give')
+        return vn, None
+    except Exception as exc:
+        return None, str(exc)
+
+ROLE_EXPLANATIONS = {
+    'Agent':'The intentional participant who carries out the action.',
+    'Patient':'An entity affected or changed by the event.',
+    'Theme':'An entity involved in, moved by, or undergoing the event.',
+    'Experiencer':'A participant who feels or perceives a state or event.',
+    'Recipient':'The participant who receives something.',
+    'Stimulus':'The entity or situation that triggers a perception or emotion.',
+    'Destination':'The endpoint of movement or transfer.',
+    'Source':'The starting point of movement or transfer.',
+    'Instrument':'An object used to perform the action.',
+    'Location':'Where the event takes place.',
+    'Result':'The resulting state or entity.',
+    'Beneficiary':'The participant for whose benefit an action occurs.',
+    'Topic':'The subject matter of an event.',
+    'Cause':'The participant or event that causes another event.',
+    'Actor':'A participant acting in an event.',
+    'Asset':'A resource exchanged in a transaction.',
+}
+
+def _participant_nodes(verb):
+    """Extract grammatical participants, not yet semantic roles."""
+    participants=[]
+    for child in verb.children:
+        d=child.dep_.lower()
+        if d in ('nsubj','nsubjpass','csubj','csubjpass'):
+            participants.append(('SUBJECT',phrase(child),d))
+        elif d in ('dobj','obj','attr','oprd','acomp'):
+            participants.append(('OBJECT',phrase(child),d))
+        elif d in ('dative','iobj'):
+            participants.append(('INDIRECT OBJECT',phrase(child),d))
+        elif d in ('prep','agent'):
+            pobj=next((x for x in child.children if x.dep_ in ('pobj','obj')),None)
+            if pobj is not None:
+                participants.append(('PP '+child.text.lower(),child.text+' '+phrase(pobj),d))
+    # spaCy's clausal main predicate may be an ADJ with copula as dependent.
+    return participants
+
+def _frame_description(frame):
+    try:
+        desc=frame.get('description',{})
+        return str(desc.get('primary','')) if isinstance(desc,dict) else str(desc)
+    except Exception:
+        return ''
+
+def _frame_slots(frame):
+    slots=[]
+    for node in frame.get('syntax',[]):
+        if isinstance(node,dict):
+            pos=str(node.get('pos_tag','')).upper()
+            role=str(node.get('modifiers',{}).get('value','')) if isinstance(node.get('modifiers'),dict) else ''
+            if pos=='NP':
+                slots.append(('NP',role))
+            elif pos in ('PP','PREP','ADJ','ADV','S','S_INF','VP'):
+                slots.append((pos,role))
+    return slots
+
+def _match_frame(frame, participants):
+    """Conservative ordering heuristic: never claim exact verified match."""
+    slots=_frame_slots(frame)
+    nps=[role for pos,role in slots if pos=='NP' and role]
+    subj=next((x for x in participants if x[0]=='SUBJECT'),None)
+    obj=next((x for x in participants if x[0]=='OBJECT'),None)
+    indirect=next((x for x in participants if x[0]=='INDIRECT OBJECT'),None)
+    if not subj or not nps:
+        return -1,[]
+    # Standard active subject and object alignment; a passive needs special handling.
+    if 'pass' in subj[2]:
+        return -1,[]
+    bindings=[(subj,nps[0])]
+    if obj and len(nps)>1:
+        bindings.append((obj,nps[1]))
+    if indirect and len(nps)>2:
+        bindings.append((indirect,nps[2]))
+    # Reject transitive frames if object is absent, and vice versa.
+    if obj and len(nps)<2:
+        return -1,[]
+    if len(nps)>1 and not obj and not indirect:
+        return -1,[]
+    score=3*len(bindings)-abs(len(nps)-len(bindings))*2
+    return score,bindings
+
 def roles(doc):
-    results=[]
-    for v in doc:
-        if v.pos_ != 'VERB' or v.lemma_.lower() not in LOOKUP: continue
-        group, subjrole, objrole, extra = LOOKUP[v.lemma_.lower()]
-        passive = any(c.dep_ in ('auxpass','aux:pass') for c in v.children)
-        for c in v.children:
-            dep=c.dep_.split(':')[0]
-            role=None
-            if dep in ('nsubj','csubj'):
-                role = objrole if passive and objrole else subjrole
-            elif dep in ('dobj','obj','attr','oprd'):
-                role = objrole
-            elif dep=='iobj':
-                role='Recipient'
-            elif dep in ('prep','agent','obl'):
-                p=c.text.lower()
-                if p in ('with','using'): role='Instrument' if group in ('Cutting','Cooking') else 'Co-Agent/Co-Theme'
-                elif p in ('to','into','onto','toward','towards'): role='Recipient' if group in ('Giving','Selling','Communication') else 'Destination'
-                elif p in ('from','out','of'): role='Source' if group in ('Removing','Buying') else 'Initial_Location'
-                elif p in ('through','across','along'): role='Path'
-                elif p in ('for',): role='Beneficiary' if group=='Helping' else ('Asset' if group=='Buying' else 'Purpose')
-                elif p in ('at',): role='Value' if group=='Measuring' else 'Location'
-                elif p in ('by',) and passive: role='Agent'
-                elif p in ('in','on','under'): role='Location'
-                if role and c.pos_=='ADP':
-                    complement=next((x for x in c.children if x.dep_ in ('pobj','obj')),None)
-                    if complement is not None:
-                        results.append({'Verb':v.text,'Verb group':group,'Expression':phrase(complement),'Thematic role':role,'Evidence':'Prepositional phrase (heuristic)','Status':'Suggested; verify class/frame'})
-                    continue
-            if role:
-                results.append({'Verb':v.text,'Verb group':group,'Expression':phrase(c),'Thematic role':role,'Evidence':c.dep_,'Status':'Suggested; verify class/frame'})
-        if not any(r['Verb']==v.text for r in results):
-            results.append({'Verb':v.text,'Verb group':group,'Expression':'—','Thematic role':'Not resolved','Evidence':'No matching dependency','Status':'Manual annotation required'})
-    return results
+    vn,error=get_verbnet()
+    rows=[]; summaries=[]
+    predicates=[t for t in doc if t.pos_=='VERB']
+    # Also display copular predicates separately; they may not have a VerbNet class.
+    for t in doc:
+        if t.pos_=='ADJ' and any(c.dep_=='acomp' or c.lemma_.lower()=='be' for c in t.children):
+            if t not in predicates: predicates.append(t)
+    predicates.sort(key=lambda t:t.i)
+    for v in predicates:
+        lemma=v.lemma_.lower()
+        parts=_participant_nodes(v)
+        classids=[]
+        if vn:
+            try: classids=vn.classids(lemma)
+            except Exception: classids=[]
+        summary={'Predicate':v.text,'Lemma':lemma,'VerbNet classes':', '.join(classids[:12]) if classids else 'Not found',
+                 'Selected candidate':'None','Candidate frame':'None','Match status':'No verified frame',
+                 'Interpretation':'A candidate class is not a confirmed sense.'}
+        best=None
+        for cid in classids[:35]:
+            try: frames=vn.frames(cid)
+            except Exception: continue
+            for f in frames:
+                score,bindings=_match_frame(f,parts)
+                if score>=3 and (best is None or score>best[0]):
+                    best=(score,cid,_frame_description(f),bindings)
+        if best:
+            _,cid,desc,bindings=best
+            summary.update({'Selected candidate':cid,'Candidate frame':desc or 'Unlabelled frame',
+                            'Match status':'Tentative syntactic alignment; review required',
+                            'Interpretation':'NP slots aligned by surface order; polysemy and semantic restrictions are not resolved.'})
+            for part,role in bindings:
+                rows.append({'Predicate':v.text,'Lemma':lemma,'VerbNet class (candidate)':cid,
+                             'Expression':part[1],'Grammatical evidence':part[0]+' / '+part[2],
+                             'Thematic role (suggested)':role,
+                             'Explanation':ROLE_EXPLANATIONS.get(role,'Role name from the candidate VerbNet frame; consult the class definition.'),
+                             'Reliability':'Tentative; manually verify frame and role'})
+            bound={(p[0],p[1]) for p,_ in bindings}
+            for part in parts:
+                if (part[0],part[1]) not in bound:
+                    rows.append({'Predicate':v.text,'Lemma':lemma,'VerbNet class (candidate)':cid,
+                                 'Expression':part[1],'Grammatical evidence':part[0]+' / '+part[2],
+                                 'Thematic role (suggested)':'Unresolved',
+                                 'Explanation':'No reliable role alignment for this participant.',
+                                 'Reliability':'Manual annotation needed'})
+        else:
+            # Pedagogical fallback for a common completion predicate. These are
+            # semantic hypotheses, NOT roles verified against a VerbNet frame.
+            if lemma == 'complete':
+                for part in parts:
+                    suggested = 'Agent' if part[0] == 'SUBJECT' else ('Patient' if part[0] == 'OBJECT' else 'Unresolved')
+                    rows.append({'Predicate':v.text,'Lemma':lemma,
+                                 'VerbNet class (candidate)':', '.join(classids[:3]) or 'Not verified',
+                                 'Expression':part[1], 'Grammatical evidence':part[0]+' / '+part[2],
+                                 'Thematic role (suggested)':suggested,
+                                 'Explanation':('Teaching suggestion based on grammatical structure; not a verified VerbNet frame. '+ROLE_EXPLANATIONS.get(suggested,'')),
+                                 'Reliability':'Teaching heuristic only — verify with VerbNet 3.3'})
+                summary['Interpretation']='The displayed Agent/Patient roles are teaching suggestions, not a confirmed VerbNet frame.'
+                summary['Match status']='Heuristic fallback — not verified'
+                summaries.append(summary)
+                continue
+            if not classids and lemma=='be':
+                summary['Interpretation']='Copular be expresses a state here; no VerbNet event frame assigned.'
+            elif not classids:
+                summary['Interpretation']='No class returned for this lemma in the available VerbNet resource.'
+            else:
+                summary['Interpretation']='VerbNet classes exist, but no compatible basic active frame was found.'
+            for part in parts:
+                rows.append({'Predicate':v.text,'Lemma':lemma,'VerbNet class (candidate)':', '.join(classids[:3]) or 'None',
+                             'Expression':part[1],'Grammatical evidence':part[0]+' / '+part[2],
+                             'Thematic role (suggested)':'Unresolved',
+                             'Explanation':'Do not infer a VerbNet role without a suitable frame.',
+                             'Reliability':'Manual annotation needed'})
+        summaries.append(summary)
+    return rows,summaries,error
 
 def trim(s): return s.strip(' \n\t,;:.!?')
 
@@ -137,13 +274,13 @@ def dot_pos(rows):
 
 def dot_roles(rows):
     lines=['digraph Roles {','rankdir=LR;','node [shape=box,style="rounded,filled",fillcolor="#eaf5ef",fontname="Arial"];']
-    verbs=list(dict.fromkeys(r['Verb'] for r in rows))
+    verbs=list(dict.fromkeys(r['Predicate'] for r in rows))
     for i,v in enumerate(verbs):
         lines.append(f'v{i} [label={json.dumps("VERB: "+v)},fillcolor="#ffe9cc"];')
-        for j,r in enumerate(x for x in rows if x['Verb']==v):
+        for j,r in enumerate(x for x in rows if x['Predicate']==v):
             key=f'r{i}_{j}'
-            lines.append(f'{key} [label={json.dumps(r["Expression"]+"\n"+r["Thematic role"])}];')
-            lines.append(f'v{i} -> {key} [label={json.dumps(r["Thematic role"])}];')
+            lines.append(f'{key} [label={json.dumps(r["Expression"]+"\n"+r["Thematic role (suggested)"])}];')
+            lines.append(f'v{i} -> {key} [label={json.dumps(r["Thematic role (suggested)"])}];')
     return '\n'.join(lines+['}'])
 
 UD_NORMALIZE={'ROOT':'root','dobj':'obj','pobj':'obl','prep':'case','nsubjpass':'nsubj:pass','csubjpass':'csubj:pass','auxpass':'aux:pass','poss':'nmod:poss','npadvmod':'obl','acomp':'xcomp','attr':'xcomp','relcl':'acl:relcl','agent':'obl:agent','prt':'compound:prt','oprd':'xcomp','neg':'advmod','dative':'iobj','predet':'det:predet'}
@@ -154,8 +291,8 @@ def dot_disc(row):
     return 'digraph D {rankdir=TB; node [shape=box,style="rounded,filled",fillcolor="#eef5ff"]; root [label='+json.dumps(row['Sense suggestion'])+']; root -> arg1; root -> conn; root -> arg2; arg1 [label='+json.dumps('Arg1: '+row['Arg1'])+']; conn [label='+json.dumps('Connective: '+row['Connective'])+']; arg2 [label='+json.dumps('Arg2: '+row['Arg2'])+'];}'
 
 st.title('📚 LinguAnnotate 4D — Four-Layer Annotation Studio')
-st.caption('Penn Treebank POS • Universal Dependencies syntax • VerbNet-inspired thematic roles • PDTB 3.0-inspired discourse relations')
-st.warning('Accuracy note: Penn POS and UD dependencies are model predictions. VerbNet and PDTB sections are transparent classroom heuristics, NOT validated full VerbNet 3.3 / PDTB 3.0 automatic parsers. Check against your uploaded cheat sheets and official manuals.')
+st.caption('Penn Treebank POS • Universal Dependencies syntax • VerbNet candidate frames • PDTB 3.0-inspired discourse relations')
+st.warning('Accuracy note: Penn POS and UD dependencies are model predictions. VerbNet provides candidate classes and tentative frame-based roles (not a validated semantic-role parser). PDTB is connective-rule-based (not a trained PDTB parser). Check against your uploaded cheat sheets and official manuals.')
 nlp=get_nlp()
 if nlp is None:
     st.error('The English spaCy model is missing. Run: python -m spacy download en_core_web_sm  (then restart Streamlit).')
@@ -170,8 +307,8 @@ if st.button('Analyse all four layers',type='primary'):
     doc=nlp(text)
     posrows=[{'Token':t.text,'Lemma':t.lemma_,'Penn tag':t.tag_,'Full name':PENN.get(t.tag_,'Model-specific tag'),'Universal POS':t.pos_} for t in doc]
     synrows=[{'Token':t.text,'Head':t.head.text if t.head!=t else 'ROOT','spaCy dependency':t.dep_,'Approx. UD equivalent':ud_equivalent(t.dep_),'Meaning':UD.get(ud_equivalent(t.dep_).split(':')[0], 'Review with UD guidelines'),'Head index':t.head.i} for t in doc]
-    semrows=roles(doc);discrows=discourse(text)
-    st.session_state['results']={'pos':posrows,'syntax':synrows,'semantic':semrows,'discourse':discrows,'syntax_dot':dot_syntax(doc),'text':text}
+    semrows,sem_summary,vn_error=roles(doc);discrows=discourse(text)
+    st.session_state['results']={'pos':posrows,'syntax':synrows,'semantic':semrows,'semantic_summary':sem_summary,'verbnet_error':vn_error,'discourse':discrows,'syntax_dot':dot_syntax(doc),'text':text}
 
 if 'results' in st.session_state:
     r=st.session_state['results']
@@ -191,16 +328,31 @@ if 'results' in st.session_state:
         st.graphviz_chart(r['syntax_dot'],use_container_width=True)
         st.caption('spaCy dependency labels can differ from the canonical UD inventory (e.g., dobj versus obj). This view does not claim a fully UD-conformant parse.')
     with tabs[2]:
-        st.subheader('VerbNet-inspired thematic roles (full names)')
+        st.subheader('VerbNet — candidate classes, frames and thematic roles')
+        st.caption('The application consults the NLTK VerbNet corpus (version may differ from 3.3). Class selection and participant alignment are tentative, not gold-standard VerbNet 3.3 annotation.')
+        if r.get('verbnet_error'):
+            st.error('VerbNet corpus could not be loaded: '+r['verbnet_error'])
+            st.info('Ensure your Streamlit deployment can download the NLTK VerbNet corpus (version may differ from 3.3) during its first run.')
+        if r.get('semantic_summary'):
+            st.markdown('**Predicate and class lookup**')
+            st.dataframe(pd.DataFrame(r['semantic_summary']),use_container_width=True,hide_index=True)
+            for entry in r['semantic_summary']:
+                with st.expander('Why was '+entry['Predicate']+' analysed this way?'):
+                    st.write('**Lemma:**',entry['Lemma'])
+                    st.write('**Candidate class:**',entry['Selected candidate'])
+                    st.write('**Frame:**',entry['Candidate frame'])
+                    st.write('**Assessment:**',entry['Match status'])
+                    st.write(entry['Interpretation'])
         if r['semantic']:
-            st.markdown('**Visual semantic-role map** — arrows connect a verb to its suggested participants and full role names.')
+            st.markdown('**Visual thematic-role map**')
             st.graphviz_chart(dot_roles(r['semantic']),use_container_width=True)
+            st.markdown('**Participant-by-participant explanation**')
             st.dataframe(pd.DataFrame(r['semantic']),use_container_width=True,hide_index=True)
-            st.markdown('**How to interpret:** Verb group indicates a teaching category; Expression is the participant phrase; Thematic role is its proposed meaning in the event; Evidence shows the grammatical clue. **This is not a verified VerbNet 3.3 class/frame assignment.**')
-            st.info('These are suggested participant roles from the 20 verb groups in your cheat sheet. They are NOT predictions of official VerbNet classes, senses, or syntactic frames. Some roles may be wrong or absent.')
-        else: st.info('No supported verb-group match. Use the reference table and annotate manually.')
+        else:
+            st.info('No grammatical participants could be assigned. Inspect the class inventory and annotate manually.')
+        st.warning('A matching class and NP order do not establish the correct semantic sense. Passive clauses, complex complements, prepositional roles, and coreference require manual review. Do not use these suggestions as validated research annotations.')
         with st.expander('Role definitions'):
-            st.dataframe(pd.DataFrame([{'Role':k,'Simple meaning':v} for k,v in ROLE_GLOSS.items()]),hide_index=True,use_container_width=True)
+            st.dataframe(pd.DataFrame([{'Role':k,'Simple meaning':v} for k,v in {**ROLE_GLOSS,**ROLE_EXPLANATIONS}.items()]),hide_index=True,use_container_width=True)
     with tabs[3]:
         st.subheader('PDTB 3.0-inspired discourse analysis')
         if r['discourse']:
@@ -218,7 +370,7 @@ if 'results' in st.session_state:
         st.caption('Some connectives are ambiguous (e.g. since, while, but). Arg1/Arg2 boundaries and directional labels are approximations.')
     with tabs[4]:
         st.subheader('Download the annotations')
-        combined={'input':r['text'],'penn_pos':r['pos'],'ud_style_syntax':r['syntax'],'verbnet_inspired_roles':r['semantic'],'pdtb_rule_suggestions':r['discourse'],'method_warning':'VerbNet and PDTB results are heuristic, not validated full parsers.'}
+        combined={'input':r['text'],'penn_pos':r['pos'],'ud_style_syntax':r['syntax'],'verbnet_candidate_frames':r.get('semantic_summary',[]),'verbnet_suggested_roles':r['semantic'],'pdtb_rule_suggestions':r['discourse'],'method_warning':'VerbNet frame matching is tentative and PDTB is rule-based; neither is a validated full parser.'}
         st.download_button('Download all results (JSON)',json.dumps(combined,indent=2,ensure_ascii=False),file_name='corpus_annotation.json',mime='application/json')
         for key,name in [('pos','penn_pos'),('syntax','ud_syntax'),('semantic','thematic_roles'),('discourse','pdtb_discourse')]:
             st.download_button(f'Download {name}.csv',pd.DataFrame(r[key]).to_csv(index=False),file_name=f'{name}.csv',mime='text/csv',key='dl_'+key)
